@@ -743,12 +743,23 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     };
 };
 
+struct BucketDeviceRead {
+    std::string key;
+    uint64_t object_size;
+    uint64_t object_offset;
+    std::vector<Slice> destinations;
+};
+
 class BucketStorageBackend : public StorageBackendInterface {
    public:
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
                          const BucketBackendConfig& bucket_backend_config_);
 
     ~BucketStorageBackend();
+
+    static bool NdsRawEnabled();
+    tl::expected<void, ErrorCode> RestoreNdsBatch(
+        const std::vector<BucketDeviceRead>& requests);
 
     /**
      * @brief Offload objects in batches

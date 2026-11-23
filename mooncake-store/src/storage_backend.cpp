@@ -32,6 +32,13 @@
 
 #include <ylt/util/tl/expected.hpp>
 
+#ifdef USE_NDS_STORE
+#include <cstdlib>
+#include <string_view>
+
+#include "store_raw_bucket.h"
+#endif
+
 namespace {
 struct FdGuard {
     int fd = -1;
@@ -48,6 +55,32 @@ struct FdGuard {
         return r;
     }
 };
+#ifdef USE_NDS_STORE
+using mooncake::nds_store::RawBucketStore;
+
+bool NdsAlignedPayload() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOONCAKE_NDS_ALIGNED_PAYLOAD");
+        return value && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
+uint64_t NdsKeyPadding(uint64_t bytes) {
+    const auto alignment = RawBucketStore::kAlignment;
+    return (alignment - bytes % alignment) % alignment;
+}
+
+RawBucketStore* GetNdsRawBucketStore() {
+    static auto store = [] {
+        auto opened = RawBucketStore::Open();
+        if (!opened) LOG(ERROR) << "Cannot open the configured NDS partition or adapter";
+        return opened;
+    }();
+    return store.get();
+}
+#endif
+
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
@@ -1533,6 +1566,12 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     EvictionHandler eviction_handler) {
+#ifdef USE_NDS_STORE
+    const bool use_raw = NdsRawEnabled();
+    auto* raw = use_raw ? GetNdsRawBucketStore() : nullptr;
+    if (use_raw && (!raw || !raw->Ready() || !NdsSubmissionOpen()))
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+#endif
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -1590,7 +1629,27 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             << finalize_result.error();
     }
 
-    auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
+    auto write_bucket_result = [&]() -> tl::expected<void, ErrorCode> {
+#ifdef USE_NDS_STORE
+        if (raw) {
+            auto bytes = static_cast<uint64_t>(bucket->data_size);
+            if (NdsAlignedPayload()) {
+                if (metadatas.size() != 1 || iovs.empty() || metadatas.front().offset != 0)
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                static std::array<char, RawBucketStore::kAlignment> zeros{};
+                const auto padding = NdsKeyPadding(iovs.front().iov_len);
+                if (padding) {
+                    iovs.insert(iovs.begin() + 1, iovec{zeros.data(), padding});
+                    bytes += padding;
+                }
+            }
+            if (!raw->Append(bucket_id, iovs, bytes))
+                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+            return {};
+        }
+#endif
+        return WriteBucket(bucket_id, bucket, iovs);
+    }();
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
         ReleasePreparedWrite(pending);
@@ -1714,6 +1773,73 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
         }
     }
     return {};
+}
+
+bool BucketStorageBackend::NdsRawEnabled() {
+#ifdef USE_NDS_STORE
+    static const bool enabled = [] {
+        const char* mode = std::getenv("MOONCAKE_NDS_WRITE_MODE");
+        return mode && std::string_view(mode) == "raw-primary";
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::RestoreNdsBatch(
+    const std::vector<BucketDeviceRead>& requests) {
+#ifdef USE_NDS_STORE
+    auto* raw = GetNdsRawBucketStore();
+    if (!raw || !NdsSubmissionOpen())
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+
+    std::vector<mooncake_nds_read_span> spans;
+    std::unordered_map<int64_t, BucketReadGuard> guards;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        for (const auto& request : requests) {
+            const auto object = object_bucket_map_.find(request.key);
+            if (object == object_bucket_map_.end())
+                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+            const auto& meta = object->second;
+            const auto bucket = buckets_.find(meta.bucket_id);
+            if (bucket == buckets_.end() || meta.offset < 0 || meta.key_size < 0 ||
+                meta.data_size < 0 ||
+                static_cast<uint64_t>(meta.key_size) != request.key.size() ||
+                static_cast<uint64_t>(meta.data_size) != request.object_size ||
+                request.object_offset > request.object_size ||
+                (NdsAlignedPayload() && meta.offset != 0)) {
+                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+            const auto source = raw->Find(meta.bucket_id);
+            if (!source)
+                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+            auto offset = static_cast<uint64_t>(meta.offset) + meta.key_size;
+            if (NdsAlignedPayload()) offset += NdsKeyPadding(meta.key_size);
+            if (offset > source->bytes || request.object_offset > source->bytes - offset)
+                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+            offset += request.object_offset;
+            auto remaining = request.object_size - request.object_offset;
+            for (const auto& dest : request.destinations) {
+                if (!dest.size) continue;
+                if (!dest.ptr || dest.size > remaining || dest.size > source->bytes - offset)
+                    return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+                spans.push_back({source->fd, source->base + offset, dest.ptr, dest.size});
+                offset += dest.size;
+                remaining -= dest.size;
+            }
+            if (guards.try_emplace(meta.bucket_id, bucket->second).second &&
+                bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU) {
+                bucket->second->last_access_ns_.store(
+                    std::chrono::steady_clock::now().time_since_epoch().count(),
+                    std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!spans.empty() && raw->Restore(spans)) return {};
+#endif
+    return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(

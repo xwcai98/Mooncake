@@ -548,6 +548,11 @@ endif()
 # Sources used only by Store clients and the complete mooncake_store library.
 add_library(mooncake_store_client_objects OBJECT
             ${MOONCAKE_STORE_CLIENT_SOURCES})
+
+option(USE_NDS_STORE "Enable the LOCAL_DISK NDS restore adapter" OFF)
+if(USE_NDS_STORE)
+  target_compile_definitions(mooncake_store_client_objects PRIVATE USE_NDS_STORE)
+endif()
 set_target_properties(mooncake_store_client_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(

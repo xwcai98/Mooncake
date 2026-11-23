@@ -286,6 +286,17 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     return batch_result;
 }
 
+bool FileStorage::NdsRestoreEnabled() {
+    return BucketStorageBackend::NdsRawEnabled();
+}
+
+tl::expected<void, ErrorCode> FileStorage::RestoreNdsBatch(
+    const std::vector<BucketDeviceRead>& requests) {
+    auto* bucket = dynamic_cast<BucketStorageBackend*>(storage_backend_.get());
+    if (!bucket) return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    return bucket->RestoreNdsBatch(requests);
+}
+
 tl::expected<FileStorage::LocalBatchResult, ErrorCode>
 FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {

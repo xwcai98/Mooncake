@@ -1,0 +1,63 @@
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
+@@ -1,4 +1,5 @@
+ # Standard
++import ctypes
+ import functools
+ import json
+ import os
+@@ -208,6 +209,7 @@
+         self._contribute_memory = contribute_memory
+         self._store_initialized = False
+         self._store_init_lock = threading.Lock()
++        self._nds_kv_registration: tuple[Any, ctypes.c_void_p] | None = None
+
+         if not self._lazy_init:
+             self.store = self._setup_store()
+@@ -327,6 +329,46 @@
+             local_hostname = get_ip()
+             global_te.get_transfer_engine(local_hostname, device_name=None)
+             global_te.register_buffer(ptrs, lengths)
++        self._register_nds_kv_buffers(ptrs, lengths)
++
++    def _register_nds_kv_buffers(self, ptrs: list[int], lengths: list[int]) -> None:
++        if not self.config.enable_ssd_offload:
++            return
++        if os.getenv("MOONCAKE_NDS_WRITE_MODE") != "raw-primary":
++            return
++        if self._nds_kv_registration is not None:
++            raise RuntimeError("NDS KV buffers are already registered")
++        if not ptrs or len(ptrs) != len(lengths):
++            raise ValueError("NDS KV buffer addresses and lengths must match")
++
++        self.set_device()
++        library = ctypes.CDLL(os.path.realpath(os.environ["MOONCAKE_STORE_NDS_LIBRARY"]))
++        register = library.mooncake_nds_register_kv_buffers
++        register.argtypes = (
++            ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t),
++            ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p),
++        )
++        register.restype = ctypes.c_int
++        address_array = (ctypes.c_size_t * len(ptrs))(*ptrs)
++        length_array = (ctypes.c_size_t * len(lengths))(*lengths)
++        handle = ctypes.c_void_p()
++        result = register(address_array, length_array, len(ptrs), ctypes.byref(handle))
++        if result != 0:
++            raise RuntimeError(f"NDS KV buffer registration failed: {result}")
++        self._nds_kv_registration = (library, handle)
++
++    def close(self) -> None:
++        if self._nds_kv_registration is not None:
++            library, handle = self._nds_kv_registration
++            self.set_device()
++            unregister = library.mooncake_nds_unregister_kv_buffers
++            unregister.argtypes = (ctypes.c_void_p,)
++            unregister.restype = ctypes.c_int
++            result = unregister(handle)
++            if result != 0:
++                raise RuntimeError(f"NDS KV buffer deregistration failed: {result}")
++            self._nds_kv_registration = None
++        super().close()
+
+     def exists(self, keys: list[str]) -> list[int]:
+         if self._lazy_init and not self._store_initialized:

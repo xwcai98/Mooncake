@@ -8898,6 +8898,20 @@ RealClient::batch_get_into_offload_object_internal(
         sizes.emplace_back(storage_size);
     }
 
+    if (file_storage_ && target_rpc_service_addr == local_rpc_addr &&
+        FileStorage::NdsRestoreEnabled()) {
+        const TenantId tenant_id(client_->tenant_id());
+        std::vector<BucketDeviceRead> reads;
+        reads.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            reads.push_back({tenant_id.MakeScopedKey(keys[i]),
+                             static_cast<uint64_t>(sizes[i]),
+                             read_range ? read_range->source_offset : 0,
+                             objects.at(keys[i])});
+        }
+        return file_storage_->RestoreNdsBatch(reads);
+    }
+
     auto restored =
         restore_offload_objects(target_rpc_service_addr, keys, sizes, objects);
     if (!restored) {

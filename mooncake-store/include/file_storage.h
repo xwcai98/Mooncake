@@ -77,6 +77,10 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
+    static bool NdsRestoreEnabled();
+    tl::expected<void, ErrorCode> RestoreNdsBatch(
+        const std::vector<BucketDeviceRead>& requests);
+
     [[nodiscard]] bool HasPinnedRestoreArena() const {
         return pinned_restore_arena_allocator_ != nullptr;
     }
